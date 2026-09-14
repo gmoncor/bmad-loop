@@ -3161,6 +3161,7 @@ class SweepEngine(Engine):
     def _finish_migration_commit(
         self,
         task: StoryTask,
+        baseline: str,
         manifest: list[dict[str, Any]],
         rewrite: str,
     ) -> bool:
@@ -3183,6 +3184,8 @@ class SweepEngine(Engine):
             "chore(sweep): migrate legacy deferred-work entries to DW format",
             path=self.workspace.paths.deferred_work,
             family="ledger",
+            accepted_text=rewrite,
+            accepted_baseline_text=baseline,
         )
         if task.migration_ledger_doubt_owned and not self.state.sweep_ledger_in_doubt:
             # A Git-only unavailable outcome arms no ledger doubt. Retire the
@@ -3222,6 +3225,41 @@ class SweepEngine(Engine):
         self._emit("post_migrate", task)
         return True
 
+    def _migration_input_is_current(self, expected: str) -> bool:
+        """Whether the authoritative ledger still equals this cycle's input."""
+        try:
+            return deferredwork.read_for_write(self.workspace.paths.deferred_work) == expected
+        except (deferredwork.LedgerReadError, OSError):
+            return False
+
+    def _retire_migration_dispatch_authority(
+        self,
+        task: StoryTask,
+        *,
+        refund_attempt: bool,
+    ) -> NoReturn:
+        """Persist no-launch authority before best-effort record retirement.
+
+        A cleanup fault is intentionally allowed to propagate only after the
+        durable state says PENDING with no baseline or current-format marker.
+        Thus leftover files are inert evidence, never recovery authority.
+        """
+        task.phase = Phase.PENDING
+        task.baseline_commit = None
+        task.baseline_untracked = None
+        task.migration_recovery_format = 0
+        if refund_attempt and task.attempt > 0:
+            task.attempt -= 1
+        self._save()
+        for name in (
+            _MIGRATE_BASELINE_RECORD,
+            _MIGRATE_MANIFEST_RECORD,
+            _MIGRATE_REWRITE_RECORD,
+            _MIGRATE_RESULT_RECORD,
+        ):
+            self._remove_migration_record(self.run_dir / name)
+        raise RuntimeError("migration ledger changed before adapter launch")
+
     def _ensure_migration(self, text: str) -> None:
         """Pre-DW-format ledger content (older BMAD-method projects) blocks a
         sweep: open_ids() cannot see it and mark_done() cannot flip it. One
@@ -3256,7 +3294,7 @@ class SweepEngine(Engine):
             )
             assert rewrite is not None
             self._migration_result_evidence(task, baseline, manifest, rewrite)
-            self._finish_migration_commit(task, manifest, rewrite)
+            self._finish_migration_commit(task, baseline, manifest, rewrite)
             return
         elif task.phase == Phase.TRIAGE_VERIFY and task.migration_recovery_format not in (
             0,
@@ -3285,7 +3323,7 @@ class SweepEngine(Engine):
                     self._migration_result_evidence(task, baseline, manifest, rewrite)
                     advance(task, Phase.COMMITTING)
                     self._save()
-                    self._finish_migration_commit(task, manifest, rewrite)
+                    self._finish_migration_commit(task, baseline, manifest, rewrite)
                     return
                 # Validation completed and the accepted rewrite became durable,
                 # but result publication did not. Put the accepted legacy input
@@ -3390,6 +3428,12 @@ class SweepEngine(Engine):
         manifest = self._migration_manifest(text)
         manifest_path = self.run_dir / _MIGRATE_MANIFEST_RECORD
         confine_root = _project_of_run_dir(self.run_dir)
+        # Bind the recovery records to the same authoritative input `_loop`
+        # supplied.  This reread is deliberately immediately before the first
+        # publication and outside the ledger lock: records and Git work must
+        # never occur while that short file-I/O lock is held.
+        if not self._migration_input_is_current(text):
+            self._retire_migration_dispatch_authority(task, refund_attempt=False)
         try:
             atomic_write_text_confined(
                 self.run_dir / _MIGRATE_BASELINE_RECORD,
@@ -3417,6 +3461,11 @@ class SweepEngine(Engine):
             self._save()
             raise
 
+        # A writer may have landed after the first comparison or either durable
+        # record write.  Refuse before claiming TRIAGE_RUNNING ownership.
+        if not self._migration_input_is_current(text):
+            self._retire_migration_dispatch_authority(task, refund_attempt=False)
+
         feedback: Path | None = None
         while True:
             task.attempt += 1
@@ -3428,6 +3477,11 @@ class SweepEngine(Engine):
                 prompt=self._migrate_prompt(manifest_path, feedback),
                 seq=task.attempt,
                 session_stage="pre_migrate_session",
+                prelaunch_validator=lambda: (
+                    None
+                    if self._migration_input_is_current(text)
+                    else self._retire_migration_dispatch_authority(task, refund_attempt=True)
+                ),
             )
             advance(task, Phase.TRIAGE_VERIFY)
             self._save()
@@ -3499,7 +3553,12 @@ class SweepEngine(Engine):
                 )
                 advance(task, Phase.COMMITTING)
                 self._save()
-                self._finish_migration_commit(task, durable_manifest, durable_rewrite)
+                self._finish_migration_commit(
+                    task,
+                    durable_baseline,
+                    durable_manifest,
+                    durable_rewrite,
+                )
                 return
             # never re-prompt over a half-broken rewrite; the baseline reset
             # covers tracked files, the explicit write covers an untracked
@@ -5091,7 +5150,13 @@ class SweepEngine(Engine):
         )
 
     def _commit_ledger(
-        self, message: str, *, path: Path, family: Literal["ledger", "store"]
+        self,
+        message: str,
+        *,
+        path: Path,
+        family: Literal["ledger", "store"],
+        accepted_text: str | None = None,
+        accepted_baseline_text: str | None = None,
     ) -> _LedgerCommitOutcome:
         """Publish the orchestrator bookkeeping FILE a phase just wrote: that one
         file reaches HEAD, and everything else the enclosing repository is
@@ -5365,9 +5430,31 @@ class SweepEngine(Engine):
             # the RESOLVED target, and a refused publish must spawn no git at all.
             refusal = verify.unpublishable_target(target, family)
             if refusal is None:
-                # Preserve the clean short-circuit without catching journal write faults.
-                clean = verify.path_clean(root, target.name)
-                sha = None if clean else verify.commit_paths(root, message, [target])
+                if accepted_text is None:
+                    if accepted_baseline_text is not None:
+                        raise RuntimeError(
+                            "accepted migration baseline supplied without accepted rewrite"
+                        )
+                    # Preserve the generic clean short-circuit without catching
+                    # journal write faults.
+                    clean = verify.path_clean(root, target.name)
+                    sha = None if clean else verify.commit_paths(root, message, [target])
+                else:
+                    if accepted_baseline_text is None:
+                        raise RuntimeError(
+                            "accepted migration rewrite supplied without its baseline"
+                        )
+                    # Migration alone carries durable byte authority.  Keep the
+                    # lexical path as the live identity so a redirected configured
+                    # symlink cannot be hidden by the resolved Git operand.
+                    sha = verify.commit_path_bound(
+                        root,
+                        message,
+                        target,
+                        accepted_text=accepted_text,
+                        baseline_text=accepted_baseline_text,
+                        live_path=path,
+                    )
         except verify.GitError as e:
             # `verify.GitError` ALONE: `_run_git` translates spawn/timeout/decode
             # faults and `commit_paths` its own resolves and `lstat` probes into
